@@ -128,5 +128,20 @@ class UpdateTestCase(unittest.TestCase):
         self.assertLess(first.index("AAA"), first.index("BBB"))
 
 
+class LocalTzTests(unittest.TestCase):
+    def test_default_is_utc_plus_8(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SERENITY_LOCAL_UTC_OFFSET", None)
+            self.assertEqual(update._local_tz().utcoffset(None).total_seconds(), 8 * 3600)
+
+    def test_override_and_validation(self):
+        with mock.patch.dict(os.environ, {"SERENITY_LOCAL_UTC_OFFSET": "-5.5"}):
+            self.assertEqual(update._local_tz().utcoffset(None).total_seconds(), -5.5 * 3600)
+        for bad in ("abc", "20"):
+            with mock.patch.dict(os.environ, {"SERENITY_LOCAL_UTC_OFFSET": bad}):
+                with self.assertRaises(SystemExit):
+                    update._local_tz()
+
+
 if __name__ == "__main__":
     unittest.main()

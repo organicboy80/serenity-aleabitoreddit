@@ -25,7 +25,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 ARCH = os.path.join(DATA, "aleabitoreddit_tweets.json")
 SYNC_STATE = os.path.join(DATA, "sync_state.json")
-LOCAL_TZ = timezone(timedelta(hours=8))
+def _local_tz():
+    """Timezone for `createdAtLocal`. Defaults to UTC+8 (Asia/Shanghai), which
+    every existing archive row uses; override with SERENITY_LOCAL_UTC_OFFSET
+    (hours, e.g. "9" or "-5.5"). Changing it only affects newly added rows."""
+    raw = os.environ.get("SERENITY_LOCAL_UTC_OFFSET", "8")
+    try:
+        hours = float(raw)
+        if not -14 <= hours <= 14:
+            raise ValueError
+    except ValueError:
+        raise SystemExit(f"SERENITY_LOCAL_UTC_OFFSET must be hours in [-14, 14], got {raw!r}")
+    return timezone(timedelta(hours=hours))
+
+
+LOCAL_TZ = _local_tz()
 PUBLIC_FALLBACK_DIAGNOSTIC = None
 # Keys under which a dict-shaped dump may carry its rows.
 DUMP_LIST_KEYS = ("items", "tweets", "results", "data", "posts")
@@ -69,11 +83,8 @@ def sort_key(t):
     dt = parse_time(t)
     return dt.isoformat() if dt else ""
 
-def normalize_x_api_post(t, includes=None):
-    """Map an X API v2 post (or already-archive-shaped row) into archive schema."""
-    includes = includes or {}
-    if t.get("author", {}).get("screenName", "").lower() == USER and t.get("createdAtISO"):
-        return ensure_times(t)
+def _index_includes(includes):
+    """Index X API `includes` by media key, user id and post id."""
     media_by_key = {
         m.get("media_key"): m
         for m in (includes.get("media") or [])
@@ -89,39 +100,55 @@ def normalize_x_api_post(t, includes=None):
         for item in (includes.get(key) or []):
             if isinstance(item, dict) and item.get("id"):
                 posts_by_id[str(item["id"])] = item
+    return media_by_key, users_by_id, posts_by_id
 
-    note = ((t.get("note_tweet") or {}).get("text") if isinstance(t.get("note_tweet"), dict) else None)
+
+def _note_text(post):
+    note = post.get("note_tweet")
+    return note.get("text") if isinstance(note, dict) else None
+
+
+def _post_text(t):
+    """Prefer full `note_tweet.text`, keeping leading @mentions from `text`."""
+    note = _note_text(t)
     text_body = note or t.get("text") or ""
     trunc = t.get("text") or ""
     if note and trunc.startswith("@") and not text_body.startswith("@"):
         m = re.match(r"^((?:@\w+\s+)+)", trunc)
         if m:
             text_body = m.group(1) + text_body
+    return text_body
 
-    pm = t.get("public_metrics") or t.get("metrics") or {}
-    created = t.get("created_at") or t.get("createdAt")
-    dt = None
+
+def _post_datetime(t):
     if t.get("createdAtISO"):
-        dt = datetime.fromisoformat(t["createdAtISO"].replace("Z", "+00:00"))
-    elif created:
+        return datetime.fromisoformat(t["createdAtISO"].replace("Z", "+00:00"))
+    created = t.get("created_at") or t.get("createdAt")
+    if not created:
+        return None
+    try:
+        return datetime.fromisoformat(str(created).replace("Z", "+00:00").replace(".000", ""))
+    except ValueError:
         try:
-            dt = datetime.fromisoformat(str(created).replace("Z", "+00:00").replace(".000", ""))
-        except ValueError:
-            try:
-                dt = parsedate_to_datetime(created)
-            except Exception:
-                dt = None
+            return parsedate_to_datetime(created)
+        except Exception:
+            return None
 
-    author_user = users_by_id.get(t.get("author_id")) or {}
-    author = t.get("author") if isinstance(t.get("author"), dict) else {}
-    screen = (author.get("screenName") or author_user.get("username") or USER)
 
-    refs = t.get("referenced_tweets") or []
-    is_reply = bool(t.get("isReply")) or any(r.get("type") == "replied_to" for r in refs if isinstance(r, dict))
-    is_quote = bool(t.get("isQuote")) or any(r.get("type") == "quoted" for r in refs if isinstance(r, dict))
-    reply_to = t.get("inReplyToTweetId") or next((r.get("id") for r in refs if isinstance(r, dict) and r.get("type") == "replied_to"), None)
-    quote_id = next((r.get("id") for r in refs if isinstance(r, dict) and r.get("type") == "quoted"), None)
+def _references(t):
+    """Return (is_reply, is_quote, reply_to_id, quote_id)."""
+    refs = [r for r in (t.get("referenced_tweets") or []) if isinstance(r, dict)]
 
+    def first(kind):
+        return next((r.get("id") for r in refs if r.get("type") == kind), None)
+
+    is_reply = bool(t.get("isReply")) or any(r.get("type") == "replied_to" for r in refs)
+    is_quote = bool(t.get("isQuote")) or any(r.get("type") == "quoted" for r in refs)
+    reply_to = t.get("inReplyToTweetId") or first("replied_to")
+    return is_reply, is_quote, reply_to, first("quoted")
+
+
+def _post_media(t, media_by_key):
     media = t.get("media") if isinstance(t.get("media"), list) else []
     if not media:
         for mk in ((t.get("attachments") or {}).get("media_keys") or []):
@@ -129,59 +156,91 @@ def normalize_x_api_post(t, includes=None):
             url = m.get("url") or m.get("preview_image_url")
             if url:
                 media.append({"url": url})
+    return media
 
+
+def _post_urls(t):
     urls = t.get("urls") if isinstance(t.get("urls"), list) else []
     if not urls:
         for u in ((t.get("entities") or {}).get("urls") or []):
             exp = u.get("expanded_url") or ""
             if exp and "/photo/" not in exp:
                 urls.append(exp)
+    return urls
 
+
+def _quoted_post(t, quote_id, posts_by_id, users_by_id):
     quoted = t.get("quotedTweet")
-    if quoted is None and quote_id:
-        qt = posts_by_id.get(str(quote_id))
-        if qt:
-            qnote = ((qt.get("note_tweet") or {}).get("text") if isinstance(qt.get("note_tweet"), dict) else None)
-            quser = users_by_id.get(qt.get("author_id")) or {}
-            quoted = {
-                "id": str(qt["id"]),
-                "text": qnote or qt.get("text") or "",
-                "author": {
-                    "id": qt.get("author_id"),
-                    "name": quser.get("name"),
-                    "screenName": quser.get("username"),
-                },
-            }
-        else:
-            quoted = {"id": str(quote_id)}
+    if quoted is not None or not quote_id:
+        return quoted
+    qt = posts_by_id.get(str(quote_id))
+    if not qt:
+        return {"id": str(quote_id)}
+    quser = users_by_id.get(qt.get("author_id")) or {}
+    return {
+        "id": str(qt["id"]),
+        "text": _note_text(qt) or qt.get("text") or "",
+        "author": {
+            "id": qt.get("author_id"),
+            "name": quser.get("name"),
+            "screenName": quser.get("username"),
+        },
+    }
 
-    def metric(pm_obj, *keys):
+
+# archive metric name -> X API / archive field names, in lookup order
+METRIC_KEYS = {
+    "likes": ("likes", "like_count"),
+    "retweets": ("retweets", "retweet_count", "repost_count"),
+    "replies": ("replies", "reply_count"),
+    "quotes": ("quotes", "quote_count"),
+    "views": ("views", "impression_count"),
+    "bookmarks": ("bookmarks", "bookmark_count"),
+}
+
+
+def _post_metrics(t):
+    pm = t.get("public_metrics") or t.get("metrics") or {}
+
+    def metric(keys):
         for k in keys:
-            if isinstance(pm_obj, dict) and pm_obj.get(k) is not None:
-                return pm_obj.get(k)
+            if isinstance(pm, dict) and pm.get(k) is not None:
+                return pm.get(k)
         return None
+
+    return {name: metric(keys) for name, keys in METRIC_KEYS.items()}
+
+
+def normalize_x_api_post(t, includes=None):
+    """Map an X API v2 post (or already-archive-shaped row) into archive schema.
+
+    The key order of the returned dict is the on-disk order in the archive;
+    tests/test_normalize.py pins it.
+    """
+    includes = includes or {}
+    if t.get("author", {}).get("screenName", "").lower() == USER and t.get("createdAtISO"):
+        return ensure_times(t)
+    media_by_key, users_by_id, posts_by_id = _index_includes(includes)
+    dt = _post_datetime(t)
+    author_user = users_by_id.get(t.get("author_id")) or {}
+    author = t.get("author") if isinstance(t.get("author"), dict) else {}
+    is_reply, is_quote, reply_to, quote_id = _references(t)
+    quoted = _quoted_post(t, quote_id, posts_by_id, users_by_id)
 
     out = {
         "id": str(t.get("id")),
-        "text": text_body,
+        "text": _post_text(t),
         "author": {
             "id": author.get("id") or author_user.get("id") or t.get("author_id"),
             "name": author.get("name") or author_user.get("name") or "Serenity",
-            "screenName": screen,
+            "screenName": author.get("screenName") or author_user.get("username") or USER,
             "profileImageUrl": author.get("profileImageUrl") or author_user.get("profile_image_url"),
             "verified": author.get("verified") if "verified" in author else bool(author_user.get("verified")),
         },
-        "metrics": {
-            "likes": metric(pm, "likes", "like_count"),
-            "retweets": metric(pm, "retweets", "retweet_count", "repost_count"),
-            "replies": metric(pm, "replies", "reply_count"),
-            "quotes": metric(pm, "quotes", "quote_count"),
-            "views": metric(pm, "views", "impression_count"),
-            "bookmarks": metric(pm, "bookmarks", "bookmark_count"),
-        },
+        "metrics": _post_metrics(t),
         "createdAt": t.get("createdAt") or (dt.strftime("%a %b %d %H:%M:%S +0000 %Y") if dt else None),
-        "media": media,
-        "urls": urls,
+        "media": _post_media(t, media_by_key),
+        "urls": _post_urls(t),
         "isRetweet": bool(t.get("isRetweet")),
         "retweetedBy": t.get("retweetedBy"),
         "lang": t.get("lang"),
