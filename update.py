@@ -13,7 +13,7 @@ supported unattended path.
 Also: `--repair-public-profile` replaces rows from an older public-profile parser.
 Prints a final `NEW=<n>` line; exits 0. Does NOT touch git — the caller commits.
 """
-import json, csv, os, re, sys
+import copy, json, csv, os, re, sys, tempfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -27,6 +27,26 @@ ARCH = os.path.join(DATA, "aleabitoreddit_tweets.json")
 SYNC_STATE = os.path.join(DATA, "sync_state.json")
 LOCAL_TZ = timezone(timedelta(hours=8))
 PUBLIC_FALLBACK_DIAGNOSTIC = None
+# Keys under which a dict-shaped dump may carry its rows.
+DUMP_LIST_KEYS = ("items", "tweets", "results", "data", "posts")
+
+
+def atomic_write(path, write_fn):
+    """Write via a temp file in the same dir, then os.replace (no torn files)."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-", suffix=os.path.basename(path))
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+            write_fn(f)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def write_json(path, obj):
+    atomic_write(path, lambda f: json.dump(obj, f, ensure_ascii=False, indent=2))
+
 
 def parse_time(t):
     iso = t.get("createdAtISO")
@@ -40,7 +60,7 @@ def parse_time(t):
 def ensure_times(t):
     dt = parse_time(t)
     if dt and not t.get("createdAtISO"):
-        t["createdAtISO"] = dt.astimezone(timezone.utc).isoformat()
+        t["createdAtISO"] = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if dt and not t.get("createdAtLocal"):
         t["createdAtLocal"] = dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
     return t
@@ -188,11 +208,22 @@ def load_from_json(path):
     includes = {}
     if isinstance(raw, dict):
         includes = raw.get("includes") or {}
-        items = raw.get("items") or raw.get("tweets") or raw.get("results") or raw.get("data") or raw.get("posts") or []
+        items = next((raw[k] for k in DUMP_LIST_KEYS if raw.get(k)), [])
         if not items and all(k in raw for k in ("id", "text")):
             items = [raw]
+        # An X API page with zero results is `{"meta": {"result_count": 0}}`
+        # (no `data` key). Anything else without a recognised list is a bad
+        # dump — fail loudly instead of stamping a healthy empty check.
+        recognised = any(k in raw for k in DUMP_LIST_KEYS) or "meta" in raw or items
+        if not recognised:
+            raise ValueError(
+                f"PULL_ERROR unrecognised JSON dump shape in {path}: "
+                f"top-level keys {sorted(raw)[:8]}"
+            )
+    elif isinstance(raw, list):
+        items = raw
     else:
-        items = raw if isinstance(raw, list) else []
+        raise ValueError(f"PULL_ERROR JSON dump {path} must be a list or object")
     rows, seen = [], set()
     for t in items:
         if not isinstance(t, dict) or not t.get("id"):
@@ -232,6 +263,7 @@ def pull(n=100, since=None):
         raw.extend(public_rows)
     except Exception as exc:
         print(f"PULL_ERROR public X fallback: {exc}")
+        PUBLIC_FALLBACK_DIAGNOSTIC = {"errors": [str(exc)[:300]], "fatal": True}
     rows, seen = [], set()
     for t in raw:
         if not isinstance(t, dict) or not t.get("id"):
@@ -252,7 +284,7 @@ def write_csv(rows):
             "quoted_id", "quoted_author", "quoted_text", "text"]
     def csv_text(text):
         return "\n".join(line.rstrip() for line in (text or "").replace("\r", " ").split("\n"))
-    with open(os.path.join(DATA, "aleabitoreddit_tweets.csv"), "w", newline="") as f:
+    def write(f):
         w = csv.DictWriter(f, fieldnames=cols, lineterminator="\n"); w.writeheader()
         for t in rows:
             m = t.get("metrics") or {}; media = t.get("media") or []; qt = t.get("quotedTweet") or {}
@@ -268,20 +300,27 @@ def write_csv(rows):
                 "quoted_id": qt.get("id"), "quoted_author": (qt.get("author") or {}).get("screenName"),
                 "quoted_text": csv_text(qt.get("text")).replace("\n", " "),
                 "text": csv_text(t.get("text"))})
+    atomic_write(os.path.join(DATA, "aleabitoreddit_tweets.csv"), write)
+
+TICK = re.compile(r"\$([A-Za-z]{1,6})\b")
 
 def write_ticker_stats(rows):
-    TICK = re.compile(r"\$([A-Za-z]{1,6})\b")
+    """Single source of truth for data/ticker_stats.txt (also used by prep.py).
+
+    Ties are broken alphabetically so reruns produce byte-identical output.
+    """
     c, first, last = Counter(), {}, {}
-    for t in sorted(rows, key=lambda x: x.get("createdAtISO", "")):
+    for t in sorted(rows, key=sort_key):
         txt = (t.get("text", "") or "") + " " + ((t.get("quotedTweet") or {}).get("text", "") or "")
         d = (t.get("createdAtISO") or "")[:10]
         for m in set(TICK.findall(txt)):
             u = m.upper(); c[u] += 1; first.setdefault(u, d); last[u] = d
-    with open(os.path.join(DATA, "ticker_stats.txt"), "w") as f:
+    def write(f):
         f.write(f"Total tweets: {len(rows)}\nDistinct $tickers: {len(c)}\n\nticker  mentions  first_seen  last_seen\n")
         for tk, n in sorted(c.items(), key=lambda item: (-item[1], item[0])):
             if n >= 2:
                 f.write(f"{tk:8} {n:6}   {first[tk]}  {last[tk]}\n")
+    atomic_write(os.path.join(DATA, "ticker_stats.txt"), write)
 
 def needs_public_text_repair(post):
     text = post.get("text") or ""
@@ -344,7 +383,9 @@ def main():
     sync_state = json.load(open(SYNC_STATE)) if os.path.exists(SYNC_STATE) else {}
     sync_state_changed = False
     raw_arch = json.load(open(ARCH))
-    arch = [ensure_times(t) for t in raw_arch]
+    # ensure_times mutates in place, so compare against a deep copy; otherwise
+    # `normalized` is always False and backfilled timestamps are never saved.
+    arch = [ensure_times(t) for t in copy.deepcopy(raw_arch)]
     normalized = arch != raw_arch
     have = {t["id"] for t in arch}
     newest = max((parse_time(t) for t in arch if parse_time(t)), default=None)
@@ -386,7 +427,7 @@ def main():
         for t in public_profile_repairs:
             merged[t["id"]] = merge_public_profile_row(existing_by_id[t["id"]], t)
         rows = sorted(merged.values(), key=sort_key, reverse=True)
-        json.dump(rows, open(ARCH, "w"), ensure_ascii=False, indent=2)
+        write_json(ARCH, rows)
         write_csv(rows)
         write_ticker_stats(rows)
         for t in new:
@@ -425,8 +466,26 @@ def main():
             ),
         }
         sync_state_changed = True
+    elif not from_json and not pulled:
+        # The live pull returned nothing. That is a source failure, not a
+        # verified "no new posts": keep the cursor and say so explicitly.
+        diag = PUBLIC_FALLBACK_DIAGNOSTIC or {}
+        health = dict(sync_state.get("source_health") or {})
+        health.update({
+            "status": "error",
+            "direct_status": "error",
+            "verification_source": verification_source,
+            "freshness": "stale",
+            "new_posts_merged": 0,
+            "checked_time": checked_time,
+            "errors": (diag.get("errors") or ["public fallback returned no posts"])[:5],
+            "next_action": "Public-profile live pull returned no posts; cursor kept. "
+                           "Use the X connector + --from-json path.",
+        })
+        sync_state["source_health"] = health
+        sync_state_changed = True
     else:
-        # Always stamp a successful empty check so routines know we ran.
+        # Stamp a successful empty check so routines know we ran.
         health = dict(sync_state.get("source_health") or {})
         health.update({
             "status": "ok",
@@ -435,6 +494,7 @@ def main():
             "freshness": "verified",
             "new_posts_merged": 0,
             "checked_time": checked_time,
+            "errors": [],
             "next_action": (
                 "No new posts in --from-json dump."
                 if from_json else
@@ -448,7 +508,7 @@ def main():
         sync_state["source_health"] = health
         sync_state_changed = True
     if sync_state_changed:
-        json.dump(sync_state, open(SYNC_STATE, "w"), ensure_ascii=False, indent=2)
+        write_json(SYNC_STATE, sync_state)
         print()
     print(f"NEW={len(new)}")
     print("NEW_IDS=" + ",".join(t["id"] for t in new))
